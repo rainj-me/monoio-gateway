@@ -6,11 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-monoio-gateway = {path = '../monoio-gateway'}
-monoio-gateway-core = {path = '../monoio-gateway-core', features = ['full']}
-monoio-gateway-services = {path = '../monoio-gateway-services'}
-monoio = {version = "0.0.9", features = ['splice'], path = "../../monoio/monoio"}
-monoio-http = {version = "0.0.2", path = '../../monoio-http/monoio-http'}
+monoio-gateway = { path = '../monoio-gateway' }
+monoio-gateway-core = { path = '../monoio-gateway-core', features = ['full'] }
+monoio-gateway-services = { path = '../monoio-gateway-services' }
+monoio = { version = "0.0.9", features = ['splice'] }
+monoio-http = { version = "0.0.2", path = '../../monoio-http/monoio-http' }
 anyhow = "1"
 
 

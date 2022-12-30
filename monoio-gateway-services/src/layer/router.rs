@@ -80,7 +80,7 @@ where
             let local_encoder = Rc::new(UnsafeCell::new(GenericEncoder::new(local_write)));
             let (tx, rx) = async_channel::bounded(1);
             loop {
-                let connect_pool = self.connect_pool.clone();
+                let _connect_pool = self.connect_pool.clone();
                 match local_decoder.next().await {
                     Some(Ok(req)) => {
                         let req: Request<Payload> = req;
@@ -89,8 +89,7 @@ where
                         if let Some(rule) = m {
                             // parsed rule for this request and spawn task to handle endpoint connection
                             let proxy_pass = rule.get_proxy_pass().to_owned();
-                            handle_endpoint_connection(
-                                connect_pool,
+                            handle_endpoint_connection_directly(
                                 &proxy_pass,
                                 local_encoder.clone(),
                                 req,
@@ -147,7 +146,7 @@ where
             // exit notifier
             let (tx, rx) = async_channel::bounded(1);
             loop {
-                let connect_pool = self.connect_pool.clone();
+                let _connect_pool = self.connect_pool.clone();
                 match local_decoder.next().await {
                     Some(Ok(req)) => {
                         let req: Request<Payload> = req;
@@ -156,8 +155,7 @@ where
                         if let Some(rule) = m {
                             // parsed rule for this request and spawn task to handle endpoint connection
                             let proxy_pass = rule.get_proxy_pass().to_owned();
-                            handle_endpoint_connection(
-                                connect_pool,
+                            handle_endpoint_connection_directly(
                                 &proxy_pass,
                                 local_encoder.clone(),
                                 req,
@@ -245,6 +243,79 @@ where
     let _ = encoder.close().await;
 }
 
+/// handl backward connections directly without connection pool
+async fn handle_endpoint_connection_directly<O>(
+    proxy_pass: &Domain,
+    encoder: Rc<UnsafeCell<GenericEncoder<O>>>,
+    mut request: Request<Payload>,
+    rx: Receiver<()>,
+) where
+    O: AsyncWriteRent + 'static,
+    GenericEncoder<O>: monoio::io::sink::Sink<Response<Payload>>,
+{
+    log::info!("connect to upstream host: {}.", proxy_pass.host());
+    // open connection
+    let mut connect_svc = ConnectEndpoint::default();
+    if let Ok(Some(conn)) = connect_svc
+        .call(EndpointRequestParams {
+            endpoint: proxy_pass.clone(),
+        })
+        .await
+    {
+        let connection = Rc::new(conn);
+        {
+            let conn = connection.clone();
+            let proxy_pass_domain = proxy_pass.clone();
+            let local_encoder_clone = encoder.clone();
+            let rx_clone = rx.clone();
+            monoio::spawn(async move {
+                match conn.borrow() {
+                    ClientConnectionType::Http(i, _) => {
+                        let cloned = local_encoder_clone.clone();
+                        monoio::select! {
+                            _ = copy_response_lock(i.clone(), local_encoder_clone, proxy_pass_domain.clone()) => {}
+                            _ = rx_clone.recv() => {
+                                log::info!("client exit, now cancelling endpoint connection");
+                                handle_request_error(cloned, StatusCode::INTERNAL_SERVER_ERROR).await;
+                            }
+                        };
+                    }
+                    ClientConnectionType::Tls(i, _) => {
+                        let cloned = local_encoder_clone.clone();
+                        monoio::select! {
+                            _ = copy_response_lock(i.clone(), local_encoder_clone, proxy_pass_domain.clone()) => {}
+                            _ = rx_clone.recv() => {
+                                log::info!("client exit, now cancelling endpoint connection");
+                                handle_request_error(cloned, StatusCode::INTERNAL_SERVER_ERROR).await;
+                            }
+                        };
+                    }
+                }
+            });
+        }
+        {
+            let conn = connection.clone();
+            let proxy_pass_domain = proxy_pass.clone();
+            monoio::spawn(async move {
+                Rewrite::rewrite_request(&mut request, &proxy_pass_domain);
+                match conn.borrow() {
+                    ClientConnectionType::Http(_, sender) => {
+                        let sender = unsafe { &mut *sender.get() };
+                        let _ = sender.send_and_flush(request).await;
+                    }
+                    ClientConnectionType::Tls(_, sender) => {
+                        let sender = unsafe { &mut *sender.get() };
+                        let _ = sender.send_and_flush(request).await;
+                    }
+                }
+            });
+        }
+    } else {
+        handle_request_error(encoder, StatusCode::NOT_FOUND).await;
+    }
+}
+
+#[cfg(dead_code)]
 /// handle backward connections and send request to endpoint.
 /// This function use spawn feature of monoio and will not block caller.
 async fn handle_endpoint_connection<O>(

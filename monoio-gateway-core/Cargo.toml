@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 monoio = { version = "0.0.9", features = ['splice'] }
 monoio-http = { version = "0.0.2", path = "../../monoio-http/monoio-http" }
-monoio-rustls = { version = "0.0.7", path = "../../monoio-tls/monoio-rustls", features = [
+monoio-rustls = { version = "0.0.7", features = [
     "tls12",
 ], default-features = false }
 
