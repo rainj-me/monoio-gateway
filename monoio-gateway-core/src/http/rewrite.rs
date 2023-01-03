@@ -8,40 +8,43 @@ use crate::dns::http::Domain;
 
 pub struct Rewrite;
 
+// TODO: change to rewrite headers.
 impl Rewrite {
     #[inline]
     pub fn rewrite_request(request: &mut Request<Payload>, remote: &Domain) {
-        let authority = remote.authority();
-        if authority.is_none() {
-            // ignore rewrite
-            return;
+        match remote.authority() {
+            Some(authority) => {
+                let header_value = HeaderValue::from_str(authority.as_str())
+                    .unwrap_or(HeaderValue::from_static(""));
+                log::debug!(
+                    "Request: {:?} -> {:?}",
+                    request.headers().get(http::header::HOST),
+                    header_value
+                );
+                request
+                    .headers_mut()
+                    .insert(http::header::HOST, header_value);
+            }
+            None => return,
         }
-        let new_header = HeaderValue::from_str(authority.unwrap().as_str())
-            .unwrap_or(HeaderValue::from_static(""));
-        log::debug!(
-            "Request: {:?} -> {:?}",
-            request.headers().get(http::header::HOST),
-            new_header
-        );
-        request.headers_mut().insert(http::header::HOST, new_header);
     }
 
     #[inline]
     pub fn rewrite_response(response: &mut Response<Payload>, local: &Domain) {
-        let authority = local.authority();
-        if authority.is_none() || response.headers().get(http::header::HOST).is_none() {
-            // ignore rewrite
-            return;
+        match local.authority() {
+            Some(authority) => {
+                let header_value = HeaderValue::from_str(authority.as_str())
+                    .unwrap_or(HeaderValue::from_static(""));
+                log::debug!(
+                    "Response: {:?} <- {:?}",
+                    header_value,
+                    response.headers().get(http::header::HOST)
+                );
+                response
+                    .headers_mut()
+                    .insert(http::header::HOST, header_value);
+            }
+            None => return,
         }
-        let new_header = HeaderValue::from_str(authority.unwrap().as_str())
-            .unwrap_or(HeaderValue::from_static(""));
-        log::debug!(
-            "Response: {:?} <- {:?}",
-            new_header,
-            response.headers().get(http::header::HOST)
-        );
-        response
-            .headers_mut()
-            .insert(http::header::HOST, new_header);
     }
 }

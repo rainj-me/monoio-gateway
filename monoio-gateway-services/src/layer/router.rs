@@ -273,7 +273,7 @@ async fn handle_endpoint_connection_directly<O>(
                     ClientConnectionType::Http(i, _) => {
                         let cloned = local_encoder_clone.clone();
                         monoio::select! {
-                            _ = copy_response_lock(i.clone(), local_encoder_clone, proxy_pass_domain.clone()) => {}
+                            _ = copy_response_lock(i.clone(), local_encoder_clone, proxy_pass_domain) => {}
                             _ = rx_clone.recv() => {
                                 log::info!("client exit, now cancelling endpoint connection");
                                 handle_request_error(cloned, StatusCode::INTERNAL_SERVER_ERROR).await;
@@ -283,7 +283,7 @@ async fn handle_endpoint_connection_directly<O>(
                     ClientConnectionType::Tls(i, _) => {
                         let cloned = local_encoder_clone.clone();
                         monoio::select! {
-                            _ = copy_response_lock(i.clone(), local_encoder_clone, proxy_pass_domain.clone()) => {}
+                            _ = copy_response_lock(i.clone(), local_encoder_clone, proxy_pass_domain) => {}
                             _ = rx_clone.recv() => {
                                 log::info!("client exit, now cancelling endpoint connection");
                                 handle_request_error(cloned, StatusCode::INTERNAL_SERVER_ERROR).await;
@@ -295,9 +295,8 @@ async fn handle_endpoint_connection_directly<O>(
         }
         {
             let conn = connection.clone();
-            let proxy_pass_domain = proxy_pass.clone();
+            Rewrite::rewrite_request(&mut request, proxy_pass);
             monoio::spawn(async move {
-                Rewrite::rewrite_request(&mut request, &proxy_pass_domain);
                 match conn.borrow() {
                     ClientConnectionType::Http(_, sender) => {
                         let sender = unsafe { &mut *sender.get() };
