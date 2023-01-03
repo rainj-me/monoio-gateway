@@ -37,8 +37,15 @@ impl Proxy for HttpProxy {
         async {
             let routes = Rc::new(self.config.to_owned());
             let ty = self.config.protocol;
+            let listener_config = ListenerConfig {
+                reuse_port: true,
+                reuse_addr: true,
+                backlog: 4096,
+                send_buf_size: None,
+                recv_buf_size: None,
+            };
             let listen_addr = format!("0.0.0.0:{}", self.get_listen_port().unwrap());
-            let listener = TcpListener::bind_with_config(listen_addr, &ListenerConfig::default());
+            let listener = TcpListener::bind_with_config(listen_addr, &listener_config);
             if let Err(e) = listener {
                 bail!("Error when binding address({})", e);
             }
