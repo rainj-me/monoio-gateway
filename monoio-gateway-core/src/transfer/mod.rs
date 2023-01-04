@@ -173,7 +173,8 @@ where
             }
         }
     }
-    let _ = remote.close().await;
+    // TODO: we should not close frontend conn here
+    // let _ = remote.close().await;
     Ok(())
 }
 
