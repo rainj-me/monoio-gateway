@@ -141,18 +141,18 @@ where
 }
 
 pub async fn copy_response_lock<Read, Write>(
-    local: Rc<UnsafeCell<Read>>,
-    remote: Rc<UnsafeCell<Write>>,
+    outgoing_resp_reader: Rc<UnsafeCell<Read>>,
+    incoming_resp_writer: Rc<UnsafeCell<Write>>,
     domain: Domain,
 ) -> Result<(), std::io::Error>
 where
     Read: Stream<Item = Result<Response<Payload>, DecodeError>> + FillPayload,
     Write: Sink<Response<Payload>>,
 {
-    let local = unsafe { &mut *local.get() };
-    let remote = unsafe { &mut *remote.get() };
+    let outgoing_resp_reader = unsafe { &mut *outgoing_resp_reader.get() };
+    let incoming_resp_writer = unsafe { &mut *incoming_resp_writer.get() };
     loop {
-        match local.next().await {
+        match outgoing_resp_reader.next().await {
             Some(Ok(response)) => {
                 let mut response: Response = response;
                 Rewrite::rewrite_response(&mut response, &domain);
@@ -161,7 +161,10 @@ where
                     response.status(),
                     response.headers(),
                 );
-                let _ = monoio::join!(local.fill_payload(), remote.send_and_flush(response));
+                let _ = monoio::join!(
+                    outgoing_resp_reader.fill_payload(),
+                    incoming_resp_writer.send_and_flush(response)
+                );
             }
             Some(Err(decode_error)) => {
                 log::warn!("DecodeError: {}", decode_error);

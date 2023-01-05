@@ -1,9 +1,9 @@
-use std::{
-    fmt::Display,
-    future::Future,
-};
+use std::{fmt::Display, future::Future};
 
-use http::{uri::Authority, Uri};
+use http::{
+    uri::{Authority, Scheme},
+    Uri,
+};
 use serde::{Deserialize, Serialize};
 
 use super::Resolvable;
@@ -48,6 +48,10 @@ impl Domain {
 
     pub fn authority(&self) -> Option<&Authority> {
         self.uri.authority()
+    }
+
+    pub fn scheme(&self) -> Option<&Scheme> {
+        self.uri.scheme()
     }
 
     #[inline]

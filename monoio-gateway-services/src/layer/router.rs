@@ -29,6 +29,7 @@ use monoio_http::{
         payload::Payload,
     },
 };
+use monoio_http_client::Client;
 
 use crate::layer::endpoint::ConnectEndpoint;
 
@@ -43,8 +44,8 @@ pub type SharedTcpConnectPool<I, O> =
 
 pub struct RouterService<A, I, O: AsyncWriteRent> {
     routes: Rc<RouterConfig<A>>,
-
     connect_pool: SharedTcpConnectPool<I, O>,
+    client: Rc<Client>,
 }
 
 impl<A, I, O> Clone for RouterService<A, I, O>
@@ -55,6 +56,7 @@ where
         Self {
             routes: self.routes.clone(),
             connect_pool: self.connect_pool.clone(),
+            client: self.client.clone(),
         }
     }
 }
@@ -72,35 +74,52 @@ where
     where
         Self: 'a;
 
-    fn call(&mut self, local_stream: Accept<S>) -> Self::Future<'_> {
+    fn call(&mut self, incoming_stream: Accept<S>) -> Self::Future<'_> {
         async move {
-            let (stream, socketaddr) = local_stream;
-            let (local_read, local_write) = stream.into_split();
-            let mut local_decoder = RequestDecoder::new(local_read);
-            let local_encoder = Rc::new(UnsafeCell::new(GenericEncoder::new(local_write)));
-            let (tx, rx) = async_channel::bounded(1);
+            let (stream, socketaddr) = incoming_stream;
+            let (incoming_read, incoming_write) = stream.into_split();
+            let mut incoming_req_decoder = RequestDecoder::new(incoming_read);
+            let incoming_resp_encoder =
+                Rc::new(UnsafeCell::new(GenericEncoder::new(incoming_write)));
+            // let (tx, rx) = async_channel::bounded(1);
             loop {
                 let _connect_pool = self.connect_pool.clone();
-                match local_decoder.next().await {
+                match incoming_req_decoder.next().await {
                     Some(Ok(req)) => {
-                        let req: Request<Payload> = req;
-
                         let m = longest_match(req.uri().path(), self.routes.get_rules());
                         if let Some(rule) = m {
                             // parsed rule for this request and spawn task to handle endpoint connection
                             let proxy_pass = rule.get_proxy_pass().to_owned();
-                            handle_endpoint_connection_directly(
-                                &proxy_pass,
-                                local_encoder.clone(),
-                                req,
-                                rx.clone(),
-                            )
-                            .await;
-                            continue;
+                            let mut req = req;
+                            Rewrite::rewrite_request(&mut req, &proxy_pass);
+                            let uri = req.uri().clone();
+                            let client = self.client.clone();
+                            let incoming_resp_encoder = incoming_resp_encoder.clone();
+                            monoio::spawn(async move {
+                                match client.send(req).await {
+                                    Ok(resp) => {
+                                        let incoming_resp_encoder =
+                                            unsafe { &mut *incoming_resp_encoder.get() };
+                                        let _ = incoming_resp_encoder.send_and_flush(resp).await;
+                                    }
+                                    Err(e) => {
+                                        debug!("send request to {:?} with error:  {:?}", uri, e);
+                                        handle_request_error(
+                                            incoming_resp_encoder.clone(),
+                                            StatusCode::INTERNAL_SERVER_ERROR,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            });
+                            break;
                         } else {
                             debug!("no matching router rule for request uri:  {}", req.uri());
-                            handle_request_error(local_encoder.clone(), StatusCode::NOT_FOUND)
-                                .await;
+                            handle_request_error(
+                                incoming_resp_encoder.clone(),
+                                StatusCode::NOT_FOUND,
+                            )
+                            .await;
                         }
                     }
                     Some(Err(err)) => {
@@ -115,8 +134,8 @@ where
                 }
             }
             // notify disconnect from endpoints
-            rx.close();
-            let _ = tx.send(()).await;
+            // rx.close();
+            // let _ = tx.send(()).await;
             Ok(())
         }
     }
@@ -137,27 +156,26 @@ where
     where
         Self: 'a;
 
-    fn call(&mut self, local_stream: TlsAccept<S>) -> Self::Future<'_> {
+    fn call(&mut self, incoming_stream: TlsAccept<S>) -> Self::Future<'_> {
         async move {
-            let (stream, socketaddr, _) = local_stream;
-            let (local_read, local_write) = stream.split();
-            let mut local_decoder = RequestDecoder::new(local_read);
-            let local_encoder = Rc::new(UnsafeCell::new(GenericEncoder::new(local_write)));
+            let (stream, socketaddr, _) = incoming_stream;
+            let (incoming_read, incoming_write) = stream.split();
+            let mut incoming_req_decoder = RequestDecoder::new(incoming_read);
+            let incoming_resp_encoder =
+                Rc::new(UnsafeCell::new(GenericEncoder::new(incoming_write)));
             // exit notifier
             let (tx, rx) = async_channel::bounded(1);
             loop {
                 let _connect_pool = self.connect_pool.clone();
-                match local_decoder.next().await {
+                match incoming_req_decoder.next().await {
                     Some(Ok(req)) => {
-                        let req: Request<Payload> = req;
-
                         let m = longest_match(req.uri().path(), self.routes.get_rules());
                         if let Some(rule) = m {
                             // parsed rule for this request and spawn task to handle endpoint connection
                             let proxy_pass = rule.get_proxy_pass().to_owned();
                             handle_endpoint_connection_directly(
                                 &proxy_pass,
-                                local_encoder.clone(),
+                                incoming_resp_encoder.clone(),
                                 req,
                                 rx.clone(),
                             )
@@ -165,8 +183,11 @@ where
                             continue;
                         } else {
                             debug!("no matching router rule for request uri: {}", req.uri());
-                            handle_request_error(local_encoder.clone(), StatusCode::NOT_FOUND)
-                                .await;
+                            handle_request_error(
+                                incoming_resp_encoder.clone(),
+                                StatusCode::NOT_FOUND,
+                            )
+                            .await;
                         }
                     }
                     Some(Err(err)) => {
@@ -197,6 +218,7 @@ where
         Self {
             routes,
             connect_pool: Default::default(),
+            client: Rc::new(Client::new()),
         }
     }
 }
@@ -233,20 +255,24 @@ fn get_host(req: &Request<Payload>) -> Option<&str> {
     }
 }
 
-async fn handle_request_error<O>(encoder: Rc<UnsafeCell<GenericEncoder<O>>>, status: StatusCode)
-where
+async fn handle_request_error<O>(
+    incoming_resp_encoder: Rc<UnsafeCell<GenericEncoder<O>>>,
+    status: StatusCode,
+) where
     O: AsyncWriteRent + 'static,
     GenericEncoder<O>: monoio::io::sink::Sink<Response<Payload>>,
 {
-    let encoder = unsafe { &mut *encoder.get() };
-    let _ = encoder.send_and_flush(generate_response(status)).await;
-    let _ = encoder.close().await;
+    let incoming_resp_encoder = unsafe { &mut *incoming_resp_encoder.get() };
+    let _ = incoming_resp_encoder
+        .send_and_flush(generate_response(status))
+        .await;
+    let _ = incoming_resp_encoder.close().await;
 }
 
 /// handl backward connections directly without connection pool
 async fn handle_endpoint_connection_directly<O>(
     proxy_pass: &Domain,
-    encoder: Rc<UnsafeCell<GenericEncoder<O>>>,
+    incoming_resp_encoder: Rc<UnsafeCell<GenericEncoder<O>>>,
     mut request: Request<Payload>,
     rx: Receiver<()>,
 ) where
@@ -266,27 +292,26 @@ async fn handle_endpoint_connection_directly<O>(
         {
             let conn = connection.clone();
             let proxy_pass_domain = proxy_pass.clone();
-            let local_encoder_clone = encoder.clone();
+            // let local_encoder_clone = encoder.clone();
             let rx_clone = rx.clone();
             monoio::spawn(async move {
                 match conn.borrow() {
-                    ClientConnectionType::Http(i, _) => {
-                        let cloned = local_encoder_clone.clone();
+                    ClientConnectionType::Http(outgoing_resp_reader, _) => {
+                        //let cloned = encoder.clone();
                         monoio::select! {
-                            _ = copy_response_lock(i.clone(), local_encoder_clone, proxy_pass_domain) => {}
+                            _ = copy_response_lock(outgoing_resp_reader.clone(), incoming_resp_encoder.clone(), proxy_pass_domain) => {}
                             _ = rx_clone.recv() => {
                                 log::info!("client exit, now cancelling endpoint connection");
-                                handle_request_error(cloned, StatusCode::INTERNAL_SERVER_ERROR).await;
+                                handle_request_error(incoming_resp_encoder.clone(), StatusCode::INTERNAL_SERVER_ERROR).await;
                             }
                         };
                     }
-                    ClientConnectionType::Tls(i, _) => {
-                        let cloned = local_encoder_clone.clone();
+                    ClientConnectionType::Tls(outgoing_resp_reader, _) => {
                         monoio::select! {
-                            _ = copy_response_lock(i.clone(), local_encoder_clone, proxy_pass_domain) => {}
+                            _ = copy_response_lock(outgoing_resp_reader.clone(),  incoming_resp_encoder.clone(), proxy_pass_domain) => {}
                             _ = rx_clone.recv() => {
                                 log::info!("client exit, now cancelling endpoint connection");
-                                handle_request_error(cloned, StatusCode::INTERNAL_SERVER_ERROR).await;
+                                handle_request_error(incoming_resp_encoder.clone(), StatusCode::INTERNAL_SERVER_ERROR).await;
                             }
                         };
                     }
@@ -298,19 +323,19 @@ async fn handle_endpoint_connection_directly<O>(
             Rewrite::rewrite_request(&mut request, proxy_pass);
             monoio::spawn(async move {
                 match conn.borrow() {
-                    ClientConnectionType::Http(_, sender) => {
-                        let sender = unsafe { &mut *sender.get() };
-                        let _ = sender.send_and_flush(request).await;
+                    ClientConnectionType::Http(_, outgoing_req_writer) => {
+                        let outgoing_req_writer = unsafe { &mut *outgoing_req_writer.get() };
+                        let _ = outgoing_req_writer.send_and_flush(request).await;
                     }
-                    ClientConnectionType::Tls(_, sender) => {
-                        let sender = unsafe { &mut *sender.get() };
-                        let _ = sender.send_and_flush(request).await;
+                    ClientConnectionType::Tls(_, outgoing_req_writer) => {
+                        let outgoing_req_writer = unsafe { &mut *outgoing_req_writer.get() };
+                        let _ = outgoing_req_writer.send_and_flush(request).await;
                     }
                 }
             });
         }
     } else {
-        handle_request_error(encoder, StatusCode::NOT_FOUND).await;
+        handle_request_error(incoming_resp_encoder, StatusCode::NOT_FOUND).await;
     }
 }
 

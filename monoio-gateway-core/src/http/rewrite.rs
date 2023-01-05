@@ -1,4 +1,4 @@
-use http::HeaderValue;
+use http::{uri::Scheme, HeaderValue, Uri};
 use monoio_http::{
     common::{request::Request, response::Response},
     h1::payload::Payload,
@@ -24,6 +24,23 @@ impl Rewrite {
                 request
                     .headers_mut()
                     .insert(http::header::HOST, header_value);
+
+                let scheme = match remote.scheme() {
+                    Some(scheme) => scheme.to_owned(),
+                    None => Scheme::HTTP,
+                };
+
+                let uri = request.uri_mut();
+                let path_and_query = match uri.path_and_query() {
+                    Some(path_and_query) => path_and_query.as_str(),
+                    None => "/",
+                };
+                *uri = Uri::builder()
+                    .authority(authority.to_owned())
+                    .scheme(scheme)
+                    .path_and_query(path_and_query)
+                    .build()
+                    .unwrap();
             }
             None => return,
         }
