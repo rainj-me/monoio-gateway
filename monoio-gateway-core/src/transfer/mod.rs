@@ -172,13 +172,12 @@ where
             }
             None => {
                 log::info!("backward reached EOF, bye");
-                let _ = remote.close().await;
+                // TODO: we should not close frontend conn here
+                let _ = incoming_resp_writer.close().await;
                 break;
             }
         }
     }
-    // TODO: we should not close frontend conn here
-
     Ok(())
 }
 
